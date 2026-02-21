@@ -1,7 +1,15 @@
 "use client";
 
-import { useState } from "react";
-import { useAccount, useSendTransaction, useSignTypedData } from "wagmi";
+import { useState, useEffect } from "react";
+import {
+  useAccount,
+  usePublicClient,
+  useSendTransaction,
+  useSignTypedData,
+  useSwitchChain,
+  useWalletClient,
+} from "wagmi";
+import { sepolia } from "wagmi/chains";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,7 +19,7 @@ import type { EngagementMetrics } from "@/lib/types";
 import type { HedgeRecommendation } from "@/lib/types";
 import { SEPOLIA_TOKEN_ADDRESSES } from "@/lib/constants";
 import { ETH_DECIMALS, USDC_DECIMALS } from "@/lib/constants";
-import { formatUnits, parseUnits } from "viem";
+import { formatUnits, parseUnits, waitForTransactionReceipt } from "viem";
 import { Shield, ArrowRightLeft, ExternalLink, Loader2, Wallet, Zap } from "lucide-react";
 
 const TOKEN_LABELS: Record<string, string> = {
@@ -22,6 +30,16 @@ const TOKEN_LABELS: Record<string, string> = {
 interface HedgePanelProps {
   metrics: EngagementMetrics | null;
   disabled: boolean;
+  /** Scenario key so parent can scope error/txHash per tab (e.g. "down" | "up") */
+  scenarioKey?: string;
+  /** Controlled error message (scoped per scenario by parent) */
+  error?: string | null;
+  /** Controlled tx hash (scoped per scenario by parent) */
+  txHash?: string | null;
+  /** Called when error should be set (parent stores by scenarioKey) */
+  onError?: (value: string | null) => void;
+  /** Called when tx hash should be set (parent stores by scenarioKey) */
+  onTxHash?: (value: string | null) => void;
 }
 
 interface UniswapQuoteResponse {
@@ -31,29 +49,73 @@ interface UniswapQuoteResponse {
   routing: string;
 }
 
-export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
+const CHAIN_ID_SEPOLIA = 11155111;
+
+export function HedgePanel({
+  metrics,
+  disabled,
+  scenarioKey,
+  error: controlledError,
+  txHash: controlledTxHash,
+  onError,
+  onTxHash,
+}: HedgePanelProps) {
   const { address, isConnected } = useAccount();
+  const publicClient = usePublicClient({ chainId: CHAIN_ID_SEPOLIA });
+  const { data: walletClient } = useWalletClient({ chainId: CHAIN_ID_SEPOLIA });
+  const { switchChainAsync } = useSwitchChain();
   const { sendTransactionAsync } = useSendTransaction();
   const { signTypedDataAsync } = useSignTypedData();
 
   const [amount, setAmount] = useState("0.01");
   const [quote, setQuote] = useState<UniswapQuoteResponse | null>(null);
   const [loading, setLoading] = useState(false);
-  const [txHash, setTxHash] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+
+  const isControlled = onError != null && onTxHash != null;
+  const error = isControlled ? (controlledError ?? null) : undefined;
+  const txHash = isControlled ? (controlledTxHash ?? null) : undefined;
+  const [internalError, setInternalError] = useState<string | null>(null);
+  const [internalTxHash, setInternalTxHash] = useState<string | null>(null);
+
+  const displayError = isControlled ? error : internalError;
+  const displayTxHash = isControlled ? txHash : internalTxHash;
+  const setError = isControlled ? (v: string | null) => onError?.(v) : setInternalError;
+  const setTxHash = isControlled ? (v: string | null) => onTxHash?.(v) : setInternalTxHash;
+
+  // Invalidate quote when amount changes so we never execute a stale amount
+  useEffect(() => {
+    setQuote(null);
+  }, [amount]);
 
   const recommendation = metrics ? getHedgeRecommendation(metrics) : null;
   const isSwapToStable = recommendation?.recommendedTokenOut === SEPOLIA_TOKEN_ADDRESSES.USDC;
 
   const handleGetQuote = async () => {
     if (!address || !recommendation) return;
+    const trimmed = amount.trim();
+    if (!trimmed || trimmed === "0" || trimmed === "0.") {
+      setError("Enter an amount greater than 0");
+      return;
+    }
     setLoading(true);
     setError(null);
     setQuote(null);
     try {
       const tokenIn = recommendation.recommendedTokenIn;
       const decimals = tokenIn === SEPOLIA_TOKEN_ADDRESSES.ETH ? ETH_DECIMALS : USDC_DECIMALS;
-      const amountWei = parseUnits(amount, decimals);
+      let amountWei: bigint;
+      try {
+        amountWei = parseUnits(trimmed, decimals);
+      } catch {
+        setError("Invalid amount (use a number, e.g. 0.0001 or 1)");
+        setLoading(false);
+        return;
+      }
+      if (amountWei === 0n) {
+        setError("Amount is too small");
+        setLoading(false);
+        return;
+      }
 
       const res = await fetch("/api/uniswap/quote", {
         method: "POST",
@@ -77,12 +139,104 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
     }
   };
 
+  const sendTx = async (
+    tx: { to: string; data: string; value?: string; chainId?: number },
+    waitForReceipt = false
+  ): Promise<string> => {
+    const valueHex = tx.value;
+    const value = typeof valueHex === "string" && valueHex.startsWith("0x")
+      ? BigInt(valueHex)
+      : BigInt(valueHex ?? "0");
+    const request = {
+      to: tx.to as `0x${string}`,
+      data: tx.data as `0x${string}`,
+      value,
+      chain: sepolia,
+    };
+    // Prefer wallet client with explicit chain (fixes "chain: undefined" in Phantom/wallets)
+    let hash: string;
+    if (walletClient) {
+      hash = await walletClient.sendTransaction(request);
+    } else {
+      hash = await sendTransactionAsync({
+        to: request.to,
+        data: request.data,
+        value: request.value,
+        chainId: CHAIN_ID_SEPOLIA,
+      });
+    }
+    if (waitForReceipt && publicClient && hash) {
+      await waitForTransactionReceipt(publicClient, { hash });
+    }
+    return hash;
+  };
+
   const handleExecute = async () => {
-    if (!address || !quote) return;
+    if (!address || !quote || !recommendation) return;
     setLoading(true);
     setError(null);
     try {
+      // Same as ETH: ensure wallet is on Sepolia before any tx
+      if (switchChainAsync) {
+        try {
+          await switchChainAsync({ chainId: CHAIN_ID_SEPOLIA });
+        } catch {
+          // already on chain or user rejected
+        }
+      }
+
       const { quote: q, permitData } = quote;
+      const tokenIn = recommendation.recommendedTokenIn;
+      const qObj = q as Record<string, unknown>;
+      const inputFromQuote = (qObj?.input as { amount?: string } | undefined)?.amount;
+      // Use quote input amount, or derive from current amount state so we never skip approval for USDC
+      const inputAmount =
+        inputFromQuote ??
+        (() => {
+          try {
+            return parseUnits(amount.trim(), USDC_DECIMALS).toString();
+          } catch {
+            return undefined;
+          }
+        })();
+
+      // When swapping from USDC, ensure Permit2 has token approval before swap (avoids TRANSFER_FROM_FAILED)
+      if (tokenIn === SEPOLIA_TOKEN_ADDRESSES.USDC && inputAmount) {
+        const approvalRes = await fetch("/api/uniswap/check-approval", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            walletAddress: address,
+            token: SEPOLIA_TOKEN_ADDRESSES.USDC,
+            amount: inputAmount,
+            chainId: CHAIN_ID_SEPOLIA,
+          }),
+        });
+        const approvalData = await approvalRes.json();
+        if (!approvalRes.ok) {
+          throw new Error(approvalData.error ?? approvalData.detail ?? "USDC approval check failed");
+        }
+        if (approvalData.cancel && typeof approvalData.cancel === "object") {
+          const cancelTx = approvalData.cancel as {
+            to: string;
+            data: string;
+            value?: string;
+            chainId: number;
+          };
+          await sendTx(cancelTx, true);
+        }
+        if (approvalData.approval && typeof approvalData.approval === "object") {
+          const approvalTx = approvalData.approval as {
+            to: string;
+            data: string;
+            value?: string;
+            chainId: number;
+          };
+          await sendTx(approvalTx, true);
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+
       let signature: string | undefined;
 
       if (permitData && typeof permitData === "object") {
@@ -92,14 +246,23 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
           message?: Record<string, unknown>;
           values?: object;
           primaryType?: string;
+          primary_type?: string;
         };
         const message = pd.message ?? pd.values;
         if (!message) throw new Error("Invalid permit data");
+        // API may omit primaryType or use snake_case; viem requires it to be a key in types
+        let primaryType =
+          pd.primaryType ??
+          (pd as Record<string, unknown>).primary_type as string | undefined;
+        if (!primaryType && pd.types && typeof pd.types === "object") {
+          primaryType = "PermitSingle" in pd.types ? "PermitSingle" : "PermitBatch" in pd.types ? "PermitBatch" : undefined;
+        }
+        if (!primaryType) throw new Error("Invalid permit data: missing primary type");
         signature = await signTypedDataAsync({
           domain: pd.domain,
           types: pd.types,
           message: typeof message === "object" ? message : {},
-          primaryType: pd.primaryType,
+          primaryType,
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
         } as any);
       }
@@ -116,13 +279,15 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
       const swapData = await swapRes.json();
       if (!swapRes.ok) throw new Error(swapData.error ?? "Swap failed");
 
-      const tx = swapData.swap as { to: string; data: string; value: string; chainId: number };
-      const hash = await sendTransactionAsync({
-        to: tx.to as `0x${string}`,
-        data: tx.data as `0x${string}`,
-        value: BigInt(tx.value ?? "0"),
-        chainId: tx.chainId,
-      });
+      const tx = swapData.swap as { to: string; data: string; value?: string; chainId?: number };
+      // USDC→ETH: value must be 0 (same idea as ETH→USDC where value is the ETH amount)
+      const swapValue =
+        tokenIn === SEPOLIA_TOKEN_ADDRESSES.USDC
+          ? "0"
+          : typeof tx.value === "string"
+            ? tx.value
+            : "0";
+      const hash = await sendTx({ ...tx, value: swapValue }, false);
       setTxHash(hash);
       setQuote(null);
     } catch (e) {
@@ -161,6 +326,11 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
             <p className="text-sm leading-relaxed text-muted-foreground">
               {recommendation.reasoning}
             </p>
+            <p className="text-xs text-muted-foreground">
+              {isSwapToStable
+                ? "Swap ETH → USDC to protect treasury when engagement drops."
+                : "Swap USDC → ETH to capture upside when engagement is rising."}
+            </p>
 
             {!isConnected && (
               <div className="flex items-center gap-3 rounded-lg border border-border/60 bg-muted/30 p-4">
@@ -172,9 +342,9 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
             )}
 
             <div className="space-y-2">
-              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+              <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider block">
                 Amount to swap
-              </label>
+              </span>
               <div className="relative">
                 <Input
                   type="text"
@@ -187,8 +357,8 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
                   {TOKEN_LABELS[recommendation.recommendedTokenIn]}
                 </span>
               </div>
-              <div className="flex gap-2">
-                {["0.01", "0.1", "0.5", "1"].map((val) => (
+              <div className="flex flex-wrap gap-2">
+                {["0.0001", "0.001", "0.01", "0.1", "0.5", "1"].map((val) => (
                   <button
                     key={val}
                     type="button"
@@ -217,7 +387,7 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
                 <div>
                   <p className="text-sm font-medium text-success">Transaction submitted</p>
                   <a
-                    href={`https://sepolia.etherscan.io/tx/${txHash}`}
+                    href={`https://sepolia.etherscan.io/tx/${displayTxHash}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex items-center gap-1.5 text-sm text-primary hover:underline"
@@ -274,9 +444,8 @@ export function HedgePanel({ metrics, disabled }: HedgePanelProps) {
         ) : (
           <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-border bg-muted/20 px-6 py-12 text-center">
             <Shield className="mb-4 h-12 w-12 text-muted-foreground" />
-            <h3 className="mb-2 font-semibold">Connect Instagram first</h3>
-            <p className="max-w-xs text-sm text-muted-foreground">
-              Your hedge recommendations will appear here once you connect Instagram and we analyze your engagement metrics.
+            <p className="text-sm text-muted-foreground">
+              Select a demo scenario above to see the recommended action.
             </p>
           </div>
         )}
