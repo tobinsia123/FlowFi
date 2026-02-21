@@ -1,36 +1,56 @@
 import { NextRequest, NextResponse } from "next/server";
 import type { InstagramMedia } from "@/lib/types";
 
-const INSTAGRAM_GRAPH_URL = "https://graph.instagram.com";
+const GRAPH_URL = "https://graph.facebook.com/v19.0";
 
-interface InstagramUserResponse {
+interface PageAccount {
   id: string;
-  username: string;
-  account_type?: string;
-  media_count?: number;
+  access_token: string;
+  name?: string;
 }
 
-interface InstagramMediaResponse {
+interface PagesResponse {
+  data: PageAccount[];
+}
+
+interface IGBAResponse {
+  instagram_business_account?: { id: string };
+}
+
+interface IGUserResponse {
+  username: string;
+  profile_picture_url?: string;
+}
+
+interface MediaItem {
   id: string;
-  media_type: string;
+  media_type?: string;
   media_url?: string;
   permalink?: string;
   timestamp: string;
-  username?: string;
-  like_count?: number;
-  comments_count?: number;
+  caption?: string;
 }
 
-async function fetchWithToken<T>(
-  accessToken: string,
+interface MediaListResponse {
+  data: MediaItem[];
+  paging?: { next?: string };
+}
+
+interface InsightsResponse {
+  data: { name: string; values: { value: number }[] }[];
+}
+
+async function graphGet<T>(
   path: string,
-  fields: string
+  params: Record<string, string>,
+  accessToken: string
 ): Promise<T> {
-  const url = `${INSTAGRAM_GRAPH_URL}${path}?fields=${fields}&access_token=${accessToken}`;
+  const searchParams = new URLSearchParams({ ...params, access_token: accessToken });
+  const url = `${GRAPH_URL}${path}?${searchParams.toString()}`;
   const res = await fetch(url);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.error?.message ?? `Instagram API error: ${res.status}`);
+    throw new Error(err.error?.message ?? `Graph API error: ${res.status}`);
   }
   return res.json();
 }
@@ -47,44 +67,85 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const userData = await fetchWithToken<InstagramUserResponse>(
-      accessToken,
-      "/me",
-      "id,username,account_type,media_count"
+    const pagesRes = await graphGet<PagesResponse>(
+      "/me/accounts",
+      { fields: "id,access_token,name" },
+      accessToken
     );
 
-    const mediaResponse = await fetchWithToken<{ data: InstagramMediaResponse[]; paging?: { next?: string } }>(
-      accessToken,
-      "/me/media",
-      "id,media_type,media_url,permalink,timestamp,username"
+    const pages = pagesRes.data ?? [];
+    if (pages.length === 0) {
+      return NextResponse.json(
+        { error: "No Facebook Pages found. Connect a Page linked to an Instagram Business/Creator account." },
+        { status: 400 }
+      );
+    }
+
+    const page = pages[0];
+    const pageToken = page.access_token;
+
+    const igbaRes = await graphGet<IGBAResponse>(
+      `/${page.id}`,
+      { fields: "instagram_business_account" },
+      pageToken
     );
 
-    const media = mediaResponse.data ?? [];
-    const limit = Math.min(media.length, 25);
-    const mediaIds = media.slice(0, limit).map((m) => m.id);
+    const igAccountId = igbaRes.instagram_business_account?.id;
+    if (!igAccountId) {
+      return NextResponse.json(
+        { error: "No Instagram Business Account linked to this Page. Link an IG Business/Creator account in Meta Business Settings." },
+        { status: 400 }
+      );
+    }
+
+    const userRes = await graphGet<IGUserResponse>(
+      `/${igAccountId}`,
+      { fields: "username,profile_picture_url" },
+      pageToken
+    );
+
+    const mediaRes = await graphGet<MediaListResponse>(
+      `/${igAccountId}/media`,
+      { fields: "id,media_type,media_url,permalink,timestamp,caption" },
+      pageToken
+    );
+
+    const mediaList = mediaRes.data ?? [];
+    const limit = Math.min(mediaList.length, 25);
+    const slice = mediaList.slice(0, limit);
 
     const mediaWithMetrics: InstagramMedia[] = await Promise.all(
-      mediaIds.map(async (id) => {
-        const mediaDetail = await fetchWithToken<InstagramMediaResponse>(
-          accessToken,
-          `/${id}`,
-          "id,media_type,media_url,permalink,timestamp,username,like_count,comments_count"
-        );
+      slice.map(async (m) => {
+        let engagement = 0;
+        try {
+          const insightsRes = await graphGet<InsightsResponse>(
+            `/${m.id}/insights`,
+            { metric: "engagement" },
+            pageToken
+          );
+          const engagementVal = insightsRes.data?.[0]?.values?.[0]?.value;
+          engagement = typeof engagementVal === "number" ? engagementVal : 0;
+        } catch {
+          // Insights may be unavailable for some media (e.g. albums, or delay)
+        }
         return {
-          id: mediaDetail.id,
-          media_type: mediaDetail.media_type as "IMAGE" | "VIDEO" | "CAROUSEL_ALBUM",
-          media_url: mediaDetail.media_url ?? "",
-          permalink: mediaDetail.permalink,
-          timestamp: mediaDetail.timestamp,
-          username: mediaDetail.username,
-          like_count: mediaDetail.like_count ?? 0,
-          comments_count: mediaDetail.comments_count ?? 0,
+          id: m.id,
+          media_type: (m.media_type as "IMAGE" | "VIDEO" | "CAROUSEL_ALBUM") ?? "IMAGE",
+          media_url: m.media_url ?? "",
+          permalink: m.permalink,
+          timestamp: m.timestamp,
+          username: userRes.username,
+          like_count: engagement,
+          comments_count: 0,
         };
       })
     );
 
     return NextResponse.json({
-      user: userData,
+      user: {
+        id: igAccountId,
+        username: userRes.username,
+      },
       media: mediaWithMetrics,
     });
   } catch (err) {
