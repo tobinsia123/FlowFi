@@ -2,10 +2,16 @@ import { getDefaultConfig } from "@rainbow-me/rainbowkit";
 import { http } from "wagmi";
 import { sepolia } from "wagmi/chains";
 
-const projectId = process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID;
-if (!projectId || projectId.trim() === "") {
-  throw new Error(
-    "Missing NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID. Get a free project ID at https://cloud.walletconnect.com and add it to your .env file."
+const FALLBACK_PROJECT_ID = "4bc00f380b74daa44a3d7c800f1a6335";
+const envProjectId =
+  process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID ?? process.env.WALLETCONNECT_PROJECT_ID;
+const projectId =
+  typeof envProjectId === "string" && envProjectId.trim().length > 0
+    ? envProjectId.trim()
+    : FALLBACK_PROJECT_ID;
+if (projectId === FALLBACK_PROJECT_ID) {
+  console.warn(
+    "[wagmi-config] WalletConnect project ID missing in env; using fallback hackathon project ID."
   );
 }
 
